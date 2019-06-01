@@ -10,12 +10,14 @@ An extremely fast, general mesh-deformation algorithm with arbitrary point-place
 
 The implementation is similar to Linear Blend Skinning, but the skinning weights are automatically calculated with [Inverse Distance Weighting](https://en.wikipedia.org/wiki/Inverse_distance_weighting) (in cartesian _or_ surface space), and the "bone rotations" are calculated to optimally preserve the angular relationships between the control points.
 
+
 ## [Signed Distance Field Texture Rendering](https://github.com/zalo/MathUtilities/tree/master/Assets/Volume)
 <img src="https://i.imgur.com/k7J0I7k.gif">
 
 A simple example for raymarching and painting/blitting-to volumetric distance field textures.  Distance Fields are regions of space that store the distance to the nearest surface at each point in space.  This property allows them to represent and render solid shapes of arbitrary geometry and topology.
 
 This particular implementation also stores the normalized vector toward the nearest point (the normal or gradient of the field).  This is useful for physics queries and lighting (without taking the numerical derivative).
+
 
 ## [Kabsch](https://github.com/zalo/MathUtilities/blob/master/Assets/Kabsch/Kabsch.cs)
 <img src="http://i.imgur.com/2qhRmtN.gif">
@@ -24,6 +26,13 @@ Also known as Procrustes Analysis, this algorithm can take in an arbitrary set o
 
 Update: Added an example for averaging arbitrary numbers of quaternions; possibly more accurate than a normalized lerp (averaging the quaternion components in linear space and then normalizing).
 
+
+## [Least Squares Line/Plane Fitting](https://github.com/zalo/MathUtilities/blob/master/Assets/LeastSquares/LeastSquaresFitting.cs#L24) [[Pic]](https://i.imgur.com/xTGKnx5)
+<img src="https://i.imgur.com/NBtYiIq.gif">
+
+A generic helper utility for fitting lines and planes to point-sets in 3D.  Uses a novel* matrix-less formulation to solve for the orthogonal lines and planes of best fit; algorithm is without singularities and is extensible to arbitrary dimensionality.
+
+*(as far as I know; I have not seen anyone attempt orthogonal regression without using an SVD (which may be unnecessarily expensive for just the line/plane of best fit))
 
 ## [Stereographic/Fisheye Camera](https://github.com/zalo/MathUtilities/tree/master/Assets/StereographicCamera) [[Wiki]](https://en.wikipedia.org/wiki/Stereographic_projection)
 <img src="http://i.imgur.com/MO6RLZq.gif">
@@ -42,12 +51,14 @@ Numerous examples of using verlet integration ([a subset of Position Based Dynam
 
 A textbook implementation of a Kalman filter (transcribed from wikipedia)   Kalman filters are a form of bayesian filtering; they are capable of taking in information from multiple sources and "fusing" them into a signal that is cleaner/more accurate than any of the constituent signals.  A properly tuned Kalman filter is the mathematically "optimal" technique for turning noisy data into clean data in real time (as long as the noise follows a gaussian distribution and the data varies linearly).  In practice one must deal with biases and non-linearly varying quantities.
 
+
 ## [Constraints](https://github.com/zalo/MathUtilities/tree/master/Assets/Constraints)/[Inverse Kinematics](https://github.com/zalo/MathUtilities/blob/master/Assets/IK/CCDIK/CCDIKJoint.cs)
 <img src="http://i.imgur.com/uymJf1L.gif"> <img src="http://i.imgur.com/ov58hQH.gif">
 
 A set of constraint functions that can be used to build [an iterative inverse kinematics solver.](https://makeshifted.itch.io/dexter-arm-ik)
 
 [Nice introductory Tutorial to the concept behind CCDIK and the Kinematic Jacobian](http://www.elysium-labs.com/robotics-corner/learn-robotics/introduction-to-robotics/kinematic-jacobian/)
+
 
 ### Inverse-Kinematics: [CCDIK Illustration](https://github.com/zalo/MathUtilities/tree/master/Assets/IK/Tutorials/CCDIK) vs [FABRIK Illustration](https://github.com/zalo/MathUtilities/tree/master/Assets/IK/Tutorials/FABRIK)
 <img src="https://i.imgur.com/x2AkTX2.gif"> <img src="https://i.imgur.com/kPwSHU0.gif">
@@ -81,6 +92,17 @@ A reference implementation that demonstrates how to apply bone motions to a mode
 Demonstrates how to set up a shader to project a texture onto scene geometry using a (disabled) camera as the projector frustum.  Useful for [illusions](https://github.com/zalo/MathUtilities/tree/master/Assets/Projection/Illusion).
 
 
+### [Quasirandom Point Generation](https://github.com/zalo/MathUtilities/blob/master/Assets/Quasirandom/QuasirandomSequence.cs#L16)
+<img src="https://i.imgur.com/jdq4Qrb.gif">
+
+Contains a class for generating a near-uniform quasirandom distribution of points for arbitrary dimensionality and point counts.
+Based off of the article here: http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/
+
+
+### [Distance Field Particle Displacement](https://github.com/zalo/MathUtilities/blob/master/Assets/VectorField/ParticleDistanceField.cs#L10) [[Gif]](https://imgur.com/0kWoSfJ)
+Shows an interesting technique for displacing particles to flow around distance fields (would work very well in UE4's Niagara).
+
+
 ### [Minkowski Difference Visualizer](https://github.com/zalo/MathUtilities/tree/master/Assets/Minkowski)
 <img src="https://i.imgur.com/ZmAT3Sm.gif">
 
@@ -105,6 +127,10 @@ Formula taken from this excellent course: http://underactuated.csail.mit.edu/und
 This is a technique for augmenting the end-point of trajectories composed of discrete segments, using a rigid-as-possible/"Blossoming" (Bézier-like) interpolation scheme.  Includes an implementation for both 3D and 6D trajectories.
 
 Inspired by this paper: https://april.eecs.umich.edu/media/pdfs/olson2006icra.pdf
+
+
+### [Rigid Transform Pivot Point](https://github.com/zalo/MathUtilities/tree/master/Assets/Pivot) [[Gif]](https://imgur.com/5iCUe2A)
+What appears to be a unique geometric solution for calculating the pivot point of a rigid transformation in 2D and 3D (where applicable).  Is computationally efficient, geometrically intuitive, and can be extended to arbitrary dimensions.
 
 
 ### [Thick Tesellated Plane Generator](https://github.com/zalo/MathUtilities/tree/master/Assets/ThickPlane)
@@ -141,6 +167,10 @@ My attempts at implementing [Bundle Adjustment](https://en.wikipedia.org/wiki/Bu
 
 ### [Torque Extension for HingeJoints](https://github.com/zalo/MathUtilities/tree/master/Assets/Torque)
 This adds a function to apply torque "through" HingeJoints and to Rigidbodies in general.
+
+
+### [n-Torus Encoding](https://github.com/zalo/MathUtilities/blob/master/Assets/Torus/Torus.cs#L21)
+An untested function for encoding an n-dimensional vector to the surface of an n+1 dimensional torus.  Originally intended to allow Neural Networks to learn continuous cyclic functions without ballooning the dimensionality to 2n (ie trivial x -> (sin(x), cos(x)) case).
 
 
 ### [Acceleration Dampened Rigidbodies](https://github.com/zalo/MathUtilities/tree/master/Assets/AccelerationDamping)

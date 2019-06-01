@@ -110,10 +110,11 @@ public static class Verlet {
       }
     }
 
-    public static bool operator ==(DistConstraint lhs, DistConstraint rhs) { return lhs.index1 == rhs.index1 && lhs.index2 == rhs.index2; }
+    public static bool operator ==(DistConstraint lhs, DistConstraint rhs) { return (Math.Min(lhs.index1, lhs.index2) == Math.Min(rhs.index1, rhs.index2) && Math.Max(lhs.index1, lhs.index2) == Math.Max(rhs.index1, rhs.index2)); }
     public static bool operator !=(DistConstraint lhs, DistConstraint rhs) { return !(lhs == rhs); }
-    public override int GetHashCode() { return (index1 + index2) * (index1 * index2) + (index1 + index2); }
-    public bool Equals(DistConstraint other) {return index1.Equals(other.index1) && index2.Equals(other.index2); }
+    public override int GetHashCode() { return (Math.Min(index1, index2) * 32768) + Math.Max(index1, index2); }
+    //public bool Equals(DistConstraint other) { return index1.Equals(other.index1) && index2.Equals(other.index2); }
+    public bool Equals(DistConstraint other) { return (Math.Min(index1, index2) == Math.Min(other.index1, other.index2) && Math.Max(index1, index2) == Math.Max(other.index1, other.index2)); }
     public override bool Equals(object other) {if (!(other is DistConstraint)) return false; return Equals((DistConstraint)other); }
   }
 
@@ -131,8 +132,9 @@ public static class Verlet {
     }
   }
 
-  public static void setUpConstraints(Mesh constrainedMesh, List<DistConstraint> distanceConstraints, bool Equality = false) {
+  public static void setUpConstraints(Mesh constrainedMesh, List<DistConstraint> distanceConstraints, bool Equality = false, float scale = 1f) {
     NativeArray<Vector3> constrainedVerts = new NativeArray<Vector3>(constrainedMesh.vertices, Allocator.Temp);
+    for (int i = 0; i < constrainedVerts.Length; i++) constrainedVerts[i] *= scale;
     int[] constrainedTriangles = constrainedMesh.triangles;
     List<int> edges = new List<int>(constrainedMesh.vertices.Length * 3);
 

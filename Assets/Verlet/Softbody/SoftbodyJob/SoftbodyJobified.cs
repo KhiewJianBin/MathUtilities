@@ -9,22 +9,31 @@ using Unity.Jobs.LowLevel.Unsafe;
 
 [RequireComponent(typeof(MeshFilter))]
 public class SoftbodyJobified : MonoBehaviour {
-  public Transform anchor;
+  public static List<SoftbodyJobified> s_softBodies;
+
   public Transform groundPlane;
   [Range(0.3f, 2f)]
   public float inflationAmount = 0.8f;
   [Range(1, 20)]
   public int solverIterations = 1;
+  [Range(0.1f, 10f)]
+  public float mass = 1f;
+  [Range(0.0f, 1f)]
+  public float friction = 0.3f;
   public bool transformFollowsRotation = false;
+  public bool collideWithOtherSoftbodies = true;
   public bool parallelNormals = false;
   public bool parallelConstraints = false;
   public bool useAreaVolumeAccumulator = false;
+
+  protected float radius = 1f;
 
   public struct SoftbodyData : IDisposable {
     public NativeArray<Verlet.DistConstraint> constraintsArray;
     public NativeArray<Vector3> bodyVerts;
     public NativeArray<Vector4> kabschVerts;
     public NativeArray<Vector3> prevBodyVerts;
+    public NativeArray<Vector3> preCollisionVerts;
     public NativeArray<Vector4> accumulatedDisplacements;
     public NativeArray<Vector3Int> bodyTriangles;
     public NativeArray<Vector3> bodyNormals;
@@ -34,39 +43,36 @@ public class SoftbodyJobified : MonoBehaviour {
     public NativeArray<vertexConstraints> connectionGraph;
     public NativeArray<float> triangleVolumes;
     public NativeArray<float> triangleSurfaceAreas;
-    public NativeAccumulator<float, Addition> volumeAccumulator;
-    public NativeAccumulator<float, Addition> areaAccumulator;
+    public NativeArray<RaycastCommand> raycasts;
+    public NativeArray<RaycastHit> raycastHits;
 
     public Matrix4x4 localToWorld, worldToLocal;
     public Vector3 scaledGravity, groundPlanePos, groundPlaneNormal;
-    public float initialVolume, initialSurfaceArea, previousDeltaTime;
+    public float initialVolume, initialSurfaceArea, previousDeltaTime, radius, friction;
 
-    public SoftbodyData(Mesh bodyMesh, Transform transform, List<Verlet.DistConstraint> constraintsList, Vector3 scaledGravity, Transform ground) {
+    public SoftbodyData(Mesh bodyMesh, Transform transform, List<Verlet.DistConstraint> constraintsList, Vector3 scaledGravity, Transform ground, float radius = 1f, float friction = 0.3f) {
       bodyVerts = new NativeArray<Vector3>(bodyMesh.vertices, Allocator.Persistent);
+      for (int i = 0; i < bodyVerts.Length; i++) bodyVerts[i] *= radius;
+      preCollisionVerts = new NativeArray<Vector3>(bodyVerts, Allocator.Persistent);
       kabschVerts = new NativeArray<Vector4>(Array.ConvertAll(bodyVerts.ToArray(), (p => new Vector4(p.x, p.y, p.z, 1f))), Allocator.Persistent);
       int[] triangles = bodyMesh.triangles; Vector3Int[] tris = new Vector3Int[triangles.Length / 3];
-      for (int i = 0; i < tris.Length; i++) {
-        tris[i] = new Vector3Int(triangles[i * 3], triangles[(i * 3) + 1], triangles[(i * 3) + 2]);
-      }
+      for (int i = 0; i < tris.Length; i++) tris[i] = new Vector3Int(triangles[i * 3], triangles[(i * 3) + 1], triangles[(i * 3) + 2]);
       bodyTriangles = new NativeArray<Vector3Int>(tris, Allocator.Persistent);
       bodyNormals = new NativeArray<Vector3>(bodyMesh.normals, Allocator.Persistent);
       renderNormals = new NativeArray<Vector3>(bodyMesh.normals, Allocator.Persistent);
       prevBodyVerts = new NativeArray<Vector3>(new Vector3[bodyVerts.Length], Allocator.Persistent);
       accumulatedDisplacements = new NativeArray<Vector4>(new Vector4[bodyVerts.Length], Allocator.Persistent);
-      for (int i = 0; i < bodyVerts.Length; i++) {
-        prevBodyVerts[i] = transform.TransformPoint(bodyVerts[i]);
-      }
+      for (int i = 0; i < bodyVerts.Length; i++) prevBodyVerts[i] = transform.TransformPoint(bodyVerts[i]);
+      raycasts = new NativeArray<RaycastCommand>(new RaycastCommand[bodyVerts.Length], Allocator.Persistent);
+      raycastHits = new NativeArray<RaycastHit>(new RaycastHit[bodyVerts.Length], Allocator.Persistent);
 
       constraintsArray = new NativeArray<Verlet.DistConstraint>(constraintsList.ToArray(), Allocator.Persistent);
       dilationDistance = new NativeArray<float>(new float[1], Allocator.Persistent);
       triangleVolumes = new NativeArray<float>(new float[tris.Length], Allocator.Persistent);
       triangleSurfaceAreas = new NativeArray<float>(new float[tris.Length], Allocator.Persistent);
 
-      volumeAccumulator = new NativeAccumulator<float, Addition>(Allocator.Persistent);
-      areaAccumulator = new NativeAccumulator<float, Addition>(Allocator.Persistent);
-
       initialVolume = Verlet.VolumeOfMesh(bodyVerts, bodyTriangles);
-      initialSurfaceArea = 4f * 3.14159f;
+      initialSurfaceArea = Verlet.SurfaceAreaOfMesh(bodyVerts, bodyTriangles);
       previousDeltaTime = 1f;
       dilationDistance[0] = 0f;
       this.scaledGravity = scaledGravity;
@@ -74,6 +80,8 @@ public class SoftbodyJobified : MonoBehaviour {
       worldToLocal = transform.worldToLocalMatrix;
       groundPlanePos = ground.position;
       groundPlaneNormal = -ground.forward;
+      this.radius = radius;
+      this.friction = friction;
 
       //Set up parallel normal accumulation
       triangleGraph = new NativeArray<vertexTriangles>(new vertexTriangles[bodyVerts.Length], Allocator.Persistent);
@@ -88,9 +96,7 @@ public class SoftbodyJobified : MonoBehaviour {
 
       //Set up parallel constraint satisfaction
       connectionGraph = new NativeArray<vertexConstraints>(new vertexConstraints[bodyVerts.Length], Allocator.Persistent);
-      for (int i = 0; i < connectionGraph.Length; i++) {
-        connectionGraph[i] = new vertexConstraints();
-      }
+      for (int i = 0; i < connectionGraph.Length; i++) connectionGraph[i] = new vertexConstraints();
       for (int i = 0; i < constraintsArray.Length; i++) {
         Verlet.DistConstraint constraint = constraintsArray[i];
         connectionGraph[constraint.index1] = connectionGraph[constraint.index1].Add(constraint);
@@ -100,7 +106,9 @@ public class SoftbodyJobified : MonoBehaviour {
     }
 
     public void Dispose() {
+      raycasts.Dispose();
       bodyVerts.Dispose();
+      raycastHits.Dispose();
       kabschVerts.Dispose();
       bodyNormals.Dispose();
       bodyTriangles.Dispose();
@@ -109,16 +117,15 @@ public class SoftbodyJobified : MonoBehaviour {
       triangleGraph.Dispose();
       connectionGraph.Dispose();
       triangleVolumes.Dispose();
-      areaAccumulator.Dispose();
       constraintsArray.Dispose();
       dilationDistance.Dispose();
-      volumeAccumulator.Dispose();
+      preCollisionVerts.Dispose();
       triangleSurfaceAreas.Dispose();
       accumulatedDisplacements.Dispose();
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct ToWorldSpaceJob : IJobParallelFor {
     [ReadOnly]
     public Matrix4x4 localToWorld;
@@ -128,7 +135,7 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct VerletIntegrateJob : IJobParallelFor {
     public NativeArray<Vector3> bodyVerts, prevBodyVerts;
     public Vector3 scaledGravity;
@@ -139,20 +146,20 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct AccumulateDistanceConstraintsJob : IJob {//ParallelFor {
     [ReadOnly]
     public NativeArray<Vector3> bodyVerts;
     public NativeArray<Vector4> accumulatedDisplacements;
     public NativeArray<Verlet.DistConstraint> constraintsArray;
-    public void Execute(){//int i) {
+    public void Execute() {//int i) {
       for (int i = 0; i < constraintsArray.Length; i++) {
         constraintsArray[i].ResolveConstraint(bodyVerts, ref accumulatedDisplacements);
       }
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct ApplyAccumulatedConstraintsJob : IJobParallelFor {
     public NativeArray<Vector3> bodyVerts;
     public NativeArray<Vector4> accumulatedDisplacements;
@@ -163,7 +170,7 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct CalculateDistanceConstraintsJob : IJobParallelFor {
     [ReadOnly]
     public NativeArray<Vector3> bodyVerts;
@@ -184,18 +191,19 @@ public class SoftbodyJobified : MonoBehaviour {
   //hmm what if you were able to precalculate some soft of structure that allows each vert to know all the triangles connected to it
   //then you could have 1 job that just calculates the normal of each triangle, and stores that into an array(regular parallel for job)
   //and then another job that loops through each vertex
+  //See GatherNormalsJob
 
-  [ComputeJobOptimization]
-  public struct AccumulateNormalsJob : IJob{//ParallelFor {
+  [Unity.Burst.BurstCompile]
+  public struct AccumulateNormalsJob : IJob {//ParallelFor {
     [ReadOnly]
     public NativeArray<Vector3> bodyVerts;
     [ReadOnly]
     public NativeArray<Vector3Int> bodyTriangles;
     public NativeArray<Vector3> bodyNormals;
-    public void Execute(){//int i) {
+    public void Execute() {//int i) {
       for (int i = 0; i < bodyTriangles.Length; i++) {
         Vector3 normal = Vector3.Cross(bodyVerts[bodyTriangles[i].x] - bodyVerts[bodyTriangles[i].y],
-                                       bodyVerts[bodyTriangles[i].x] - bodyVerts[bodyTriangles[i].z]);
+                                       bodyVerts[bodyTriangles[i].x] - bodyVerts[bodyTriangles[i].z]) * 0.5f * 0.3333333f;
         bodyNormals[bodyTriangles[i].x] += normal;
         bodyNormals[bodyTriangles[i].y] += normal;
         bodyNormals[bodyTriangles[i].z] += normal;
@@ -203,15 +211,17 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct NormalizeNormalsJob : IJobParallelFor {
     public NativeArray<Vector3> bodyNormals;
     public void Execute(int i) {
-      bodyNormals[i] = bodyNormals[i]/bodyNormals[i].magnitude;
+      bodyNormals[i] = bodyNormals[i] / bodyNormals[i].magnitude;
     }
   }
 
-  [ComputeJobOptimization]
+  //Not entirely happy with this solution... it's roughly the same speed as the non-parallelized version
+  //But it fills up all the CPU cores
+  [Unity.Burst.BurstCompile]
   public struct GatherNormalsJob : IJobParallelFor {
     [ReadOnly]
     public NativeArray<Vector3> bodyVerts;
@@ -220,41 +230,37 @@ public class SoftbodyJobified : MonoBehaviour {
     //[WriteOnly]
     public NativeArray<Vector3> bodyNormals;
     public void Execute(int i) {
-      /*for (int j = 0; j < vertexConnections[i].numValid.x; j++) {
-        bodyNormals[i] += Vector3.Cross(bodyVerts[vertexConnections[i][j].x] - bodyVerts[vertexConnections[i][j].y],
-                                        bodyVerts[vertexConnections[i][j].x] - bodyVerts[vertexConnections[i][j].z]);
-      }*/
       Vector3 normal = new Vector3(0f, 0f, 0f);
       if (vertexConnections[i].triangle1.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle1.x] - bodyVerts[vertexConnections[i].triangle1.y],
-                                bodyVerts[vertexConnections[i].triangle1.x] - bodyVerts[vertexConnections[i].triangle1.z]);
+                                bodyVerts[vertexConnections[i].triangle1.x] - bodyVerts[vertexConnections[i].triangle1.z]) * 0.5f * 0.3333333f;
       }
       if (vertexConnections[i].triangle2.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle2.x] - bodyVerts[vertexConnections[i].triangle2.y],
-                                bodyVerts[vertexConnections[i].triangle2.x] - bodyVerts[vertexConnections[i].triangle2.z]);
+                                bodyVerts[vertexConnections[i].triangle2.x] - bodyVerts[vertexConnections[i].triangle2.z]) * 0.5f * 0.3333333f;
       }
       if (vertexConnections[i].triangle3.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle3.x] - bodyVerts[vertexConnections[i].triangle3.y],
-                                bodyVerts[vertexConnections[i].triangle3.x] - bodyVerts[vertexConnections[i].triangle3.z]);
+                                bodyVerts[vertexConnections[i].triangle3.x] - bodyVerts[vertexConnections[i].triangle3.z]) * 0.5f * 0.3333333f;
       }
       if (vertexConnections[i].triangle4.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle4.x] - bodyVerts[vertexConnections[i].triangle4.y],
-                                bodyVerts[vertexConnections[i].triangle4.x] - bodyVerts[vertexConnections[i].triangle4.z]);
+                                bodyVerts[vertexConnections[i].triangle4.x] - bodyVerts[vertexConnections[i].triangle4.z]) * 0.5f * 0.3333333f;
       }
       if (vertexConnections[i].triangle5.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle5.x] - bodyVerts[vertexConnections[i].triangle5.y],
-                                bodyVerts[vertexConnections[i].triangle5.x] - bodyVerts[vertexConnections[i].triangle5.z]);
+                                bodyVerts[vertexConnections[i].triangle5.x] - bodyVerts[vertexConnections[i].triangle5.z]) * 0.5f * 0.3333333f;
       }
       if (vertexConnections[i].triangle6.x != -1) {
         normal += Vector3.Cross(bodyVerts[vertexConnections[i].triangle6.x] - bodyVerts[vertexConnections[i].triangle6.y],
-                                bodyVerts[vertexConnections[i].triangle6.x] - bodyVerts[vertexConnections[i].triangle6.z]);
+                                bodyVerts[vertexConnections[i].triangle6.x] - bodyVerts[vertexConnections[i].triangle6.z]) * 0.5f * 0.3333333f;
       }
 
-      bodyNormals[i] = normal / normal.magnitude;
+      //bodyNormals[i] = normal / normal.magnitude;
     }
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct AccumulateSurfaceAreaAndVolumeJob : IJobParallelFor {
     [ReadOnly]
     public NativeArray<Vector3> bodyVerts;
@@ -275,24 +281,7 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
-  public struct SurfaceAreaAndVolumeAccumulatorJob : IJobParallelFor {
-    [ReadOnly]
-    public NativeArray<Vector3> bodyVerts;
-    [ReadOnly]
-    public NativeArray<Vector3Int> bodyTriangles;
-    public NativeAccumulator<float, Addition>.Concurrent volumeAccumulator, areaAccumulator;
-    public void Execute(int i) {
-      volumeAccumulator.Accumulate(Vector3.Dot(bodyVerts[bodyTriangles[i].x],
-                                 Vector3.Cross(bodyVerts[bodyTriangles[i].y],
-                                               bodyVerts[bodyTriangles[i].z])) * 0.166666f);
-
-      areaAccumulator.Accumulate(Vector3.Cross(bodyVerts[bodyTriangles[i].y] - bodyVerts[bodyTriangles[i].x],
-                                               bodyVerts[bodyTriangles[i].z] - bodyVerts[bodyTriangles[i].x]).magnitude * 0.5f);
-    }
-  }
-
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct CalculateSurfaceAreaAndVolumeJob : IJob {
     [ReadOnly]
     public NativeArray<float> triangleVolumes, triangleSurfaceAreas;
@@ -303,9 +292,7 @@ public class SoftbodyJobified : MonoBehaviour {
     public void Execute() {
       //First, Calculate Current Volume
       float curVolume = 0f;
-      for (int i = 0; i < triangleVolumes.Length; i++) {
-        curVolume += triangleVolumes[i];
-      }
+      for (int i = 0; i < triangleVolumes.Length; i++) curVolume += triangleVolumes[i];
       curVolume = Mathf.Abs(curVolume);
 
       //And the distance we have to dilate each vert to acheive the desired volume...
@@ -313,9 +300,7 @@ public class SoftbodyJobified : MonoBehaviour {
       deltaVolume = (/*explosionResistance &&*/ curVolume > initialVolume * 2f) ? 0f : deltaVolume; //Explosion resistance
       if (deltaVolume > 0 || /*equality*/ true) {
         float curSurfaceArea = 0f;
-        for (int i = 0; i < triangleSurfaceAreas.Length; i++) {
-          curSurfaceArea += triangleSurfaceAreas[0];
-        }
+        for (int i = 0; i < triangleSurfaceAreas.Length; i++) curSurfaceArea += triangleSurfaceAreas[i];
         curSurfaceArea = Mathf.Abs(curSurfaceArea);
 
         dilationDistance[0] = deltaVolume / (initialSurfaceArea == 0f ? curSurfaceArea : initialSurfaceArea);
@@ -323,30 +308,7 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
-  public struct CalculateDilationJob : IJob {
-    [ReadOnly]
-    public NativeAccumulator<float, Addition> volumeAccumulator, areaAccumulator;
-    [ReadOnly]
-    public float initialVolume, initialSurfaceArea;
-    [WriteOnly]
-    public NativeArray<float> dilationDistance;
-    public void Execute() {
-      //First, Calculate Current Volume
-      float curVolume = Mathf.Abs(volumeAccumulator.Value);
-
-      //And the distance we have to dilate each vert to acheive the desired volume...
-      float deltaVolume = initialVolume - curVolume;
-      deltaVolume = (/*explosionResistance &&*/ curVolume > initialVolume * 2f) ? 0f : deltaVolume; //Explosion resistance
-      if (deltaVolume > 0 || /*equality*/ true) {
-        float curSurfaceArea = Mathf.Abs(areaAccumulator.Value);
-
-        dilationDistance[0] = deltaVolume / (initialSurfaceArea == 0f ? curSurfaceArea : initialSurfaceArea);
-      }
-    }
-  }
-
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct ExtrudeNormalsJob : IJobParallelFor {
     public NativeArray<Vector3> bodyVerts;
     [ReadOnly]
@@ -358,27 +320,72 @@ public class SoftbodyJobified : MonoBehaviour {
     }
   }
 
-  [ComputeJobOptimization]
-  public struct GroundCollideJob : IJobParallelFor {
+  [Unity.Burst.BurstCompile]
+  public struct VoronoiCollideJob : IJobParallelFor {
     public NativeArray<Vector3> bodyVerts;
     [ReadOnly]
     public NativeArray<Vector3> prevBodyVerts;
     [ReadOnly]
-    public Vector3 groundPlanePos, groundPlaneNormal;
+    public Vector3 planePos, planeNormal, velocity;
+    [ReadOnly]
+    public float friction, deltaTime;
     public void Execute(int i) {
-      if (Vector3.Dot(bodyVerts[i] - groundPlanePos, groundPlaneNormal) < 0f) {
-        bodyVerts[i] = projectToPlane(bodyVerts[i]-groundPlanePos, groundPlaneNormal) + groundPlanePos;
-        bodyVerts[i] -= projectToPlane(bodyVerts[i]-prevBodyVerts[i], groundPlaneNormal) * 0.3f;
+      if (Vector3.Dot(bodyVerts[i] - planePos, planeNormal) < 0f) {
+        bodyVerts[i] = projectToPlane(bodyVerts[i] - planePos, planeNormal) + planePos;
+        bodyVerts[i] -= projectToPlane(bodyVerts[i] - prevBodyVerts[i], planeNormal) * friction;
+        bodyVerts[i] += velocity * deltaTime * friction;
       }
     }
   }
 
-  //[ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
+  public struct RaycastPrepareJob : IJobParallelFor {
+    [ReadOnly]
+    public float penetrationDepth;
+    [ReadOnly]
+    public NativeArray<Vector3> bodyVerts;
+    [ReadOnly]
+    public NativeArray<Vector3> prevBodyVerts;
+    [ReadOnly]
+    public NativeArray<Vector3> bodyNormals;
+    [WriteOnly]
+    public NativeArray<RaycastCommand> raycasts;
+    [WriteOnly]
+    public NativeArray<Vector3> preCollisionVerts;
+    public void Execute(int i) {
+      preCollisionVerts[i] = bodyVerts[i];
+      raycasts[i] = new RaycastCommand(bodyVerts[i] - (bodyNormals[i] * penetrationDepth), bodyNormals[i], penetrationDepth);
+    }
+  }
+
+  [Unity.Burst.BurstCompile]
+  public struct RaycastCollisionJob : IJobParallelFor {
+    [ReadOnly]
+    public NativeArray<Vector3> prevBodyVerts;
+    [ReadOnly]
+    public NativeArray<Vector3> bodyNormals;
+    [ReadOnly]
+    public NativeArray<RaycastHit> raycastHits;
+    [ReadOnly]
+    public float friction;
+
+    public NativeArray<Vector3> bodyVerts;
+    public void Execute(int i) {
+      if (raycastHits[i].distance != 0f) {
+        if (Vector3.Dot(bodyVerts[i] - raycastHits[i].point, raycastHits[i].normal) < 0f) {
+          bodyVerts[i] = projectToPlane(bodyVerts[i] - raycastHits[i].point, raycastHits[i].normal) + raycastHits[i].point;
+          bodyVerts[i] -= projectToPlane(bodyVerts[i] - prevBodyVerts[i], raycastHits[i].normal) * friction;
+        }
+      }
+    }
+  }
+
+  [Unity.Burst.BurstCompile]
   private static Vector3 projectToPlane(Vector3 point, Vector3 normalizedPlaneNormal) {
     return point - (Vector3.Dot(point, normalizedPlaneNormal) * normalizedPlaneNormal);
   }
 
-  [ComputeJobOptimization]
+  [Unity.Burst.BurstCompile]
   public struct ToLocalSpaceJob : IJobParallelFor {
     [ReadOnly]
     public Matrix4x4 worldToLocal;
@@ -403,8 +410,16 @@ public class SoftbodyJobified : MonoBehaviour {
 
   JobHandle groundCollide;
 
+  void OnEnable() {
+    if (s_softBodies == null) s_softBodies = new List<SoftbodyJobified>();
+    s_softBodies.Add(this);
+  }
+  void OnDisable() { s_softBodies.Remove(this); }
+
   void Start() {
     //Initialize mesh and state variables
+    radius = transform.lossyScale.x;
+    transform.localScale = Vector3.one;
     MeshFilter filter = GetComponent<MeshFilter>();
     bodyMesh = Instantiate(filter.mesh);
     bodyMesh.MarkDynamic();
@@ -416,12 +431,12 @@ public class SoftbodyJobified : MonoBehaviour {
 
     //Create Distance Constraints from Triangles in Mesh
     constraintsList = new List<Verlet.DistConstraint>(originalVerts.Length * 3);
-    Verlet.setUpConstraints(bodyMesh, constraintsList, false);
+    Verlet.setUpConstraints(bodyMesh, constraintsList, true, radius);
 
-    softbodyData = new SoftbodyData(bodyMesh, transform, constraintsList, 
-      new Vector3(Physics.gravity.x / transform.lossyScale.x, 
-                  Physics.gravity.y / transform.lossyScale.y, 
-                  Physics.gravity.z / transform.lossyScale.z), groundPlane);
+    softbodyData = new SoftbodyData(bodyMesh, transform, constraintsList,
+      new Vector3(Physics.gravity.x / transform.lossyScale.x,
+                  Physics.gravity.y / transform.lossyScale.y,
+                  Physics.gravity.z / transform.lossyScale.z), groundPlane, radius, friction);
 
     priorDebuggerState = JobsUtility.JobDebuggerEnabled;
     JobsUtility.JobDebuggerEnabled = false;
@@ -430,10 +445,11 @@ public class SoftbodyJobified : MonoBehaviour {
   void Update() {
     Profiler.BeginSample("Schedule Softbody Work", this);
 
-    int batchSize = 16;
+    int batchSize = 8;
+    softbodyData.friction = friction;
 
     //Transform the points into world space
-    JobHandle localToWorldHandle = new ToWorldSpaceJob () {
+    JobHandle localToWorldHandle = new ToWorldSpaceJob() {
       localToWorld = transform.localToWorldMatrix,
       bodyVerts = softbodyData.bodyVerts
     }.Schedule(originalVerts.Length, batchSize);
@@ -480,49 +496,29 @@ public class SoftbodyJobified : MonoBehaviour {
           bodyNormals = softbodyData.bodyNormals
         }.Schedule(originalVerts.Length, batchSize, dependsOn: applyConstraints);
       } else {
-        JobHandle accumulateNormals = new AccumulateNormalsJob() {
+        calculateNormals = new AccumulateNormalsJob() {
           bodyVerts = softbodyData.bodyVerts,
           bodyTriangles = softbodyData.bodyTriangles,
           bodyNormals = softbodyData.bodyNormals
         }.Schedule(dependsOn: applyConstraints);
-        calculateNormals = new NormalizeNormalsJob() {
-          bodyNormals = softbodyData.bodyNormals
-        }.Schedule(originalVerts.Length, batchSize, dependsOn: accumulateNormals);
       }
 
       JobHandle calculateDilationDistance;
-      if (useAreaVolumeAccumulator) {
-        JobHandle accumulateDilationDistance = new SurfaceAreaAndVolumeAccumulatorJob() {
-          bodyVerts = softbodyData.bodyVerts,
-          bodyTriangles = softbodyData.bodyTriangles,
-          volumeAccumulator = softbodyData.volumeAccumulator,
-          areaAccumulator = softbodyData.areaAccumulator
-        }.Schedule(softbodyData.bodyTriangles.Length, batchSize, dependsOn: calculateNormals);
+      JobHandle accumulateDilationDistance = new AccumulateSurfaceAreaAndVolumeJob() {
+        bodyVerts = softbodyData.bodyVerts,
+        bodyTriangles = softbodyData.bodyTriangles,
+        triangleVolumes = softbodyData.triangleVolumes,
+        triangleSurfaceAreas = softbodyData.triangleSurfaceAreas
+      }.Schedule(softbodyData.bodyTriangles.Length, batchSize, dependsOn: calculateNormals);
 
-        calculateDilationDistance = new CalculateDilationJob() {
-          volumeAccumulator = softbodyData.volumeAccumulator,
-          areaAccumulator = softbodyData.areaAccumulator,
-          initialVolume = softbodyData.initialVolume * inflationAmount,
-          initialSurfaceArea = softbodyData.initialSurfaceArea,
-          dilationDistance = softbodyData.dilationDistance
-        }.Schedule(dependsOn: accumulateDilationDistance);
-      } else {
-        JobHandle accumulateDilationDistance = new AccumulateSurfaceAreaAndVolumeJob() {
-          bodyVerts = softbodyData.bodyVerts,
-          bodyTriangles = softbodyData.bodyTriangles,
-          triangleVolumes = softbodyData.triangleVolumes,
-          triangleSurfaceAreas = softbodyData.triangleSurfaceAreas
-        }.Schedule(softbodyData.bodyTriangles.Length, batchSize, dependsOn: calculateNormals);
-
-        //THIS IS THE LAST BIG ONE
-        calculateDilationDistance = new CalculateSurfaceAreaAndVolumeJob() {
-          triangleVolumes = softbodyData.triangleVolumes,
-          triangleSurfaceAreas = softbodyData.triangleSurfaceAreas,
-          initialVolume = softbodyData.initialVolume * inflationAmount,
-          initialSurfaceArea = softbodyData.initialSurfaceArea,
-          dilationDistance = softbodyData.dilationDistance
-        }.Schedule(dependsOn: accumulateDilationDistance);
-      }
+      //THIS IS THE LAST BIG ONE
+      calculateDilationDistance = new CalculateSurfaceAreaAndVolumeJob() {
+        triangleVolumes = softbodyData.triangleVolumes,
+        triangleSurfaceAreas = softbodyData.triangleSurfaceAreas,
+        initialVolume = softbodyData.initialVolume * inflationAmount,
+        initialSurfaceArea = softbodyData.initialSurfaceArea,
+        dilationDistance = softbodyData.dilationDistance
+      }.Schedule(dependsOn: accumulateDilationDistance);
 
       previousHandle = new ExtrudeNormalsJob() {
         bodyVerts = softbodyData.bodyVerts,
@@ -531,23 +527,73 @@ public class SoftbodyJobified : MonoBehaviour {
       }.Schedule(originalVerts.Length, batchSize, dependsOn: calculateDilationDistance);
     }
 
-    //Also sneak in a ground plane here:
-    JobHandle groundPlaneHandle = new GroundCollideJob() {
+    //if (!parallelNormals) {
+    previousHandle = new NormalizeNormalsJob() {
+      bodyNormals = softbodyData.bodyNormals
+    }.Schedule(originalVerts.Length, batchSize, dependsOn: previousHandle);
+    //}
+
+    //Also collide with other softbodies
+    if (collideWithOtherSoftbodies) {
+      foreach (SoftbodyJobified softbody in s_softBodies) {
+        if (softbody != this) {
+          Vector3 midPoint = Vector3.Lerp(transform.position, softbody.transform.position, (radius / softbody.radius) * 0.5f);
+          previousHandle = new VoronoiCollideJob() {
+            bodyVerts = softbodyData.bodyVerts,
+            prevBodyVerts = softbodyData.prevBodyVerts,
+            planePos = midPoint,
+            planeNormal = (transform.position - midPoint).normalized,
+            friction = 0f,
+            velocity = new Vector3(0f, 0f, 0f)
+          }.Schedule(originalVerts.Length, batchSize, dependsOn: previousHandle);
+        }
+      }
+    }
+
+    //Prepare a batch of raycast commands
+    JobHandle raycastPrepareHandle = new RaycastPrepareJob() {
       bodyVerts = softbodyData.bodyVerts,
       prevBodyVerts = softbodyData.prevBodyVerts,
-      groundPlanePos = groundPlane.position,
-      groundPlaneNormal = -groundPlane.forward
+      preCollisionVerts = softbodyData.preCollisionVerts,
+      raycasts = softbodyData.raycasts,
+      bodyNormals = softbodyData.bodyNormals,
+      penetrationDepth = 0.5f * softbodyData.radius
     }.Schedule(originalVerts.Length, batchSize, dependsOn: previousHandle);
+
+    // Schedule the batch of raycasts
+    JobHandle batchRaycastHandle = RaycastCommand.ScheduleBatch(softbodyData.raycasts, softbodyData.raycastHits, batchSize, raycastPrepareHandle);
+
+    //Apply the results of those raycasts
+    JobHandle raycastCollisionHandle = new RaycastCollisionJob() {
+      bodyVerts = softbodyData.bodyVerts,
+      prevBodyVerts = softbodyData.prevBodyVerts,
+      raycastHits = softbodyData.raycastHits,
+      bodyNormals = softbodyData.bodyNormals,
+      friction = softbodyData.friction
+    }.Schedule(originalVerts.Length, batchSize, dependsOn: batchRaycastHandle);
 
     Profiler.EndSample();
 
-    groundPlaneHandle.Complete();
+    raycastCollisionHandle.Complete();
+
+    //Calculate the impulses on PhysX objects
+    float invDT = 1 / Time.deltaTime; float vertexMass = (mass / softbodyData.bodyVerts.Length);
+    for (int i = 0; i < softbodyData.raycastHits.Length; i++) {
+      Rigidbody collidingBody;
+      if ((collidingBody = softbodyData.raycastHits[i].rigidbody) != null && !collidingBody.isKinematic) {
+        Vector3 preCollisionVelocity = (softbodyData.preCollisionVerts[i] - softbodyData.prevBodyVerts[i]) * invDT;
+        Vector3 postCollisionVelocity = (softbodyData.bodyVerts[i] - softbodyData.prevBodyVerts[i]) * invDT;
+        Vector3 deltaMomentum = (postCollisionVelocity - preCollisionVelocity) * vertexMass;
+        Vector3 netForce = -deltaMomentum * invDT;
+        collidingBody.AddForceAtPosition(netForce, softbodyData.bodyVerts[i], ForceMode.Force);
+      }
+    }
 
     //Calculate the the position and rotation of the body
     for (int i = 0; i < softbodyData.bodyVerts.Length; i++) {
       softbodyData.kabschVerts[i] = new Vector4(
-        softbodyData.bodyVerts[i].x, 
-        softbodyData.bodyVerts[i].y, 
+        softbodyData.bodyVerts[i].x,
+        softbodyData.bodyVerts[i].y,
         softbodyData.bodyVerts[i].z, 1f);
     };
     softbodyData.kabschVerts.CopyTo(kabschVertsArray);
@@ -571,13 +617,14 @@ public class SoftbodyJobified : MonoBehaviour {
     bodyMesh.normals = renderNormalsArray;
     bodyMesh.RecalculateBounds();
     bodyMesh.UploadMeshData(false);
+
+    //transform.position = Vector3.one * 3f;
   }
 
   void OnDestroy() {
     softbodyData.Dispose();
     JobsUtility.JobDebuggerEnabled = priorDebuggerState;
   }
-
 
   //Calculate the connections from each vertex to each other vertex
   [StructLayout(LayoutKind.Sequential)]
